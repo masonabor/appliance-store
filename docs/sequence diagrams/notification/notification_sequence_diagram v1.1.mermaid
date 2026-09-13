@@ -1,0 +1,88 @@
+sequenceDiagram
+    autonumber
+    actor Client as Client (or Employee)
+    participant Biz as Business service<br/>(e.g. CheckoutService)
+    participant Pub as NotificationOutboxPublisher<br/>(DomainEventPublisher)
+    participant Reg as NotificationEventMapperRegistry
+    participant Map as OrderPlacedEventMapper<br/>(subdomain-owned)
+    participant DB as App DB<br/>(aggregate + notification_outbox)
+    participant Relay as OutboxRelay<br/>(scheduled)
+    participant Kafka as Kafka<br/>(notification-events)
+    participant Listener as NotificationEventListener
+    participant Dispatch as NotificationDispatchService
+    participant Tmpl as TemplateResolver
+    participant SenderF as NotificationSenderFactory
+    participant Sender as EmailNotificationSender<br/>(or SMS / Push)
+    participant NDB as Notification DB
+
+    rect rgb(235,242,250)
+    note over Client,DB: Phase 1 — business transaction (producer side)
+    Client->>Biz: place order / register / change status
+    activate Biz
+    Biz->>DB: INSERT/UPDATE aggregate (e.g. Order)
+    Biz->>Pub: publish(OrderPlacedEvent)
+    activate Pub
+    Pub->>Reg: resolve(OrderPlacedEvent.class)
+    Reg-->>Pub: OrderPlacedEventMapper
+    Pub->>Map: map(orderPlacedEvent)
+    Map-->>Pub: NotificationEvent (canonical)
+    Pub->>DB: INSERT notification_outbox row (status=PENDING)
+    deactivate Pub
+    Biz-->>Client: 200 OK
+    deactivate Biz
+    note right of DB: Same DB transaction commits both rows atomically —<br/>aggregate change and outbox row succeed or fail together.
+    end
+
+    rect rgb(255,244,230)
+    note over Relay,Kafka: Phase 2 — relay (async, decoupled from the request)
+    loop every outbox-poll-interval
+        Relay->>DB: findPending(batchSize)
+        DB-->>Relay: List<NotificationOutbox> (PENDING rows)
+        loop for each pending row
+            Relay->>Kafka: send(NotificationEvent)
+            alt broker acknowledged
+                Kafka-->>Relay: ack
+                Relay->>DB: markPublished(id)
+            else publish failed
+                Relay->>DB: markFailed(id, error)
+                note right of Relay: row stays PENDING/FAILED,<br/>retried on next poll
+            end
+        end
+    end
+    end
+
+    rect rgb(232,245,233)
+    note over Kafka,NDB: Phase 3 — Notification Service (consumer side)
+    Kafka->>Listener: deliver NotificationEvent
+    activate Listener
+    Listener->>Dispatch: dispatch(event)
+    activate Dispatch
+    Dispatch->>Tmpl: resolve(event.eventType, event.locale)
+    Tmpl-->>Dispatch: NotificationTemplate
+    Dispatch->>Dispatch: render subject/body from event.templateData
+    Dispatch->>SenderF: getSender(recipient's channel)
+    SenderF-->>Dispatch: NotificationSender
+    Dispatch->>NDB: save Notification (status=PENDING)
+    Dispatch->>Sender: send(notification)
+    activate Sender
+    alt delivery succeeded
+        Sender-->>Dispatch: success
+        Dispatch->>NDB: update status=SENT, sentAt=now
+    else delivery failed
+        Sender-->>Dispatch: error
+        Dispatch->>NDB: update status=FAILED
+    end
+    deactivate Sender
+    deactivate Dispatch
+    Listener-->>Kafka: commit offset
+    deactivate Listener
+    end
+
+    rect rgb(250,230,230)
+    note over Listener,Kafka: Phase 4 — retry / dead-letter (failure handling)
+    loop periodic retry
+        Dispatch->>NDB: find FAILED notifications
+        Dispatch->>Sender: send(notification) (retry)
+    end
+    note over Listener,Kafka: If the listener itself repeatedly fails to<br/>process a message, it is routed to<br/>notification-events-dlq for manual inspection.
+    end
